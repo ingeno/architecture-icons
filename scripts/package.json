@@ -1,0 +1,8 @@
+{
+  "name": "aws-diagram-miro-scripts",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "elkjs": "0.12.0"
+  }
+}

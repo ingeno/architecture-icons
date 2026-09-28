@@ -1,0 +1,36 @@
+{
+ "title": "Web app on ECS Fargate",
+ "version": 1,
+ "numbered": true,
+ "groups": [
+  {"id":"cloud","type":"aws-cloud","label":"AWS Cloud"},
+  {"id":"region","type":"region","label":"ca-central-1","parent":"cloud"},
+  {"id":"vpc","type":"vpc","label":"VPC","parent":"region"},
+  {"id":"pub","type":"public-subnet","label":"Public subnet","parent":"vpc"},
+  {"id":"priv","type":"private-subnet","label":"Private subnet","parent":"vpc"}
+ ],
+ "nodes": [
+  {"id":"users","icon":"users","title":"Users"},
+  {"id":"cf","icon":"cloudfront","parent":"cloud"},
+  {"id":"alb","icon":"alb","parent":"pub"},
+  {"id":"app","icon":"fargate","label":"API service","parent":"priv"},
+  {"id":"db","icon":"rds","label":"PostgreSQL","parent":"priv"},
+  {"id":"s3","icon":"s3","label":"Static assets","parent":"region"},
+  {"id":"gh","icon":"github","title":"GitHub Actions"}
+ ],
+ "edges": [
+  {"from":"users","to":"cf","label":"HTTPS","step":1},
+  {"from":"cf","to":"s3","label":"static","step":2},
+  {"from":"cf","to":"alb","label":"/api","step":3},
+  {"from":"alb","to":"app","step":4},
+  {"from":"app","to":"db","label":"SQL","step":5},
+  {"from":"gh","to":"app","label":"deploy","style":"dashed"}
+ ],
+ "steps": [
+  {"n":1,"text":"Users reach the application over HTTPS through CloudFront."},
+  {"n":2,"text":"Static assets are served from an S3 bucket."},
+  {"n":3,"text":"API calls are forwarded to the Application Load Balancer."},
+  {"n":4,"text":"The load balancer routes requests to the Fargate service."},
+  {"n":5,"text":"The service reads and writes to Amazon RDS for PostgreSQL."}
+ ]
+}

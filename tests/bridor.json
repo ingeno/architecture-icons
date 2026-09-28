@@ -1,0 +1,43 @@
+{
+ "title": "Bridor proofers to Sentinelle",
+ "version": 1,
+ "numbered": true,
+ "groups": [
+  {"id":"plant","type":"corporate-data-center","label":"Bridor plant"},
+  {"id":"proofer","type":"generic","label":"Proofer (x12 sensors)","parent":"plant"},
+  {"id":"cloud","type":"aws-cloud","label":"AWS Cloud"},
+  {"id":"region","type":"region","label":"us-east-1","parent":"cloud"},
+  {"id":"vpc","type":"vpc","label":"Sentinelle VPC","parent":"region"},
+  {"id":"priv","type":"private-subnet","label":"Private subnet","parent":"vpc"}
+ ],
+ "nodes": [
+  {"id":"temp","icon":"res:aws-iot-thing-temperature-humidity-sensor","title":"Temp + humidity sensors","parent":"proofer"},
+  {"id":"hub","icon":"res:aws-iot-thing-industrial-pc","title":"Hypertronic concentrator","parent":"plant"},
+  {"id":"cam","icon":"camera","title":"Line cameras","label":"Vision PoC","parent":"plant"},
+  {"id":"hectiq","icon":"generic","title":"Hectiq vision","label":"weight analysis"},
+  {"id":"iot","icon":"iot core","parent":"region"},
+  {"id":"rule","icon":"res:aws-iot-rule","title":"IoT rule","parent":"region"},
+  {"id":"ts","icon":"timestream","label":"proofer readings","parent":"region"},
+  {"id":"api","icon":"fargate","title":"Sentinelle API","label":"ECS on Fargate","parent":"priv"},
+  {"id":"web","icon":"cloudfront","title":"Sentinelle web app","parent":"cloud"},
+  {"id":"ops","icon":"users","title":"Operators"}
+ ],
+ "edges": [
+  {"from":"temp","to":"hub","label":"Modbus","step":1},
+  {"from":"hub","to":"iot","label":"MQTT/TLS","step":2},
+  {"from":"iot","to":"rule","step":3},
+  {"from":"rule","to":"ts","step":3},
+  {"from":"api","to":"ts","label":"query","step":4},
+  {"from":"web","to":"api","label":"/api","step":5},
+  {"from":"ops","to":"web","label":"HTTPS","step":5},
+  {"from":"cam","to":"hectiq","label":"images","style":"dashed"},
+  {"from":"hectiq","to":"api","label":"phase 2","style":"dashed"}
+ ],
+ "steps": [
+  {"n":1,"text":"About twelve fixed sensors per proofer report temperature and humidity to the Hypertronic concentrator."},
+  {"n":2,"text":"The concentrator publishes readings to AWS IoT Core over MQTT with TLS."},
+  {"n":3,"text":"An IoT rule stores every reading in Amazon Timestream."},
+  {"n":4,"text":"The Sentinelle API reads the time series for dashboards and alerts."},
+  {"n":5,"text":"Operators follow proofer conditions in the Sentinelle web app and adjust settings manually."}
+ ]
+}

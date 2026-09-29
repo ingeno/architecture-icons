@@ -264,6 +264,7 @@ async function render(opts) {
   const frameTitle = `v${v} · ${spec.title || "Architecture"}${spec.change ? " · " + spec.change : ""}`;
 
   const out = [];
+  const pairs = []; // [icon id, label id] to group in Miro after creation
   const P = (id) => { const p = L.pos.get(id); return { x: Math.round(ox + p.x), y: Math.round(oy + p.y), w: Math.round(p.w), h: Math.round(p.h), title: p.title }; };
 
   out.push(`<svg>`);
@@ -284,6 +285,7 @@ async function render(opts) {
     const label = g.label ?? g.type;
     if (icon) {
       out.push(`<image id="gi_${g.id}" data-type="image" href="${esc(url(icon))}" x="${p.x}" y="${p.y}" width="32" height="32"/>`);
+      pairs.push([`gi_${g.id}`, `gt_${g.id}`]);
       out.push(`<text id="gt_${g.id}" x="${p.x + 40}" y="${p.y + 21}" font-family="${FONT}" font-size="14" fill="${INK}">${esc(label)}</text>`);
     } else {
       out.push(`<text id="gt_${g.id}" x="${p.x + 12}" y="${p.y + 21}" font-family="${FONT}" font-size="14" fill="${st.stroke === "#7D8998" ? INK : st.stroke}">${esc(label)}</text>`);
@@ -316,6 +318,7 @@ async function render(opts) {
     const role = n.label ? esc(n.label).replace(/\n/g, "<br/>") : "";
     if (hit) {
       out.push(`<image id="n_${n.id}" data-type="image" href="${esc(url(hit))}" x="${p.x + (p.w - ICON) / 2}" y="${p.y}" width="${ICON}" height="${ICON}"/>`);
+      pairs.push([`n_${n.id}`, `nt_${n.id}`]);
       out.push(`<textArea id="nt_${n.id}" x="${p.x}" y="${p.y + ICON + 6}" width="${p.w}" font-family="${FONT}" font-size="14" text-align="center" fill="${INK}">${title}${role ? "<br/>" + role : ""}</textArea>`);
     } else {
       out.push(`<rect id="n_${n.id}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="8" fill="#ffffff" stroke="#7D8998" stroke-width="2" data-content="&lt;b&gt;${title}&lt;/b&gt;${role ? "&lt;br&gt;" + role : ""}" data-text-color="${INK}" data-font-size="14" data-font-family="${FONT}"/>`);
@@ -353,7 +356,7 @@ async function render(opts) {
 
   const svg = out.join("\n");
   if (opts.out) fs.writeFileSync(opts.out, svg);
-  const summary = { ok: true, frame: { title: frameTitle, x: fx, y: fy, width: frameW, height: frameH }, warnings: L.warnings, icons: Object.fromEntries(nodes.map((n) => [n.id, L.resolved.get(n.id)?.id || "generic"])) };
+  const summary = { ok: true, frame: { title: frameTitle, x: fx, y: fy, width: frameW, height: frameH }, warnings: L.warnings, icons: Object.fromEntries(nodes.map((n) => [n.id, L.resolved.get(n.id)?.id || "generic"])), group_pairs: pairs };
   if (opts.out) console.log(JSON.stringify(summary, null, 1));
   else console.log(svg);
 }

@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-// aws-diagram-miro engine: pivot spec -> ELK layout -> Miro Canvas Composer SVG.
+// aws-diagram-miro engine: pivot spec -> ELK layout -> Miro SVG (sent to Miro REST by rest.mjs).
 //
 // Commands
 //   node adm.mjs resolve  --catalog catalog.json "s3" "nat gateway" "snowflake"
 //   node adm.mjs render   --spec spec.json --catalog catalog.json --base URL [--logo-base URL] [--x 0 --y 0] [--out out.svg]
 //   node adm.mjs readback --board board.svg --catalog catalog.json [--spec spec.json]
-//                         (board.svg = canvas_read_as_svg of the frame and its spec card; prints the
+//                         (board.svg = `rest.mjs tosvg` of the frame and its spec card; prints the
 //                          spec found on the board and the manual edits made since, as JSON)
 //
 // The spec (pivot format) is documented in SPEC.md next to this file.
 
 import fs from "node:fs";
 import ELK from "elkjs/lib/elk.bundled.js";
+import { optimizeBest as optimize, previewSvg } from "./opt.mjs";
 
 // ---------- AWS group conventions (AWS Architecture Icons guidelines) ----------
 const GROUPS = {
@@ -30,6 +31,11 @@ const GROUPS = {
   "spot-fleet":            { stroke: "#ED7100", fill: "none",    dash: false, icon: "grp:spot-fleet" },
   "greengrass-deployment": { stroke: "#7AA116", fill: "none",    dash: false, icon: "grp:greengrass-deployment" },
   "generic":               { stroke: "#7D8998", fill: "none",    dash: true,  icon: null },
+  // Ingeno conventions (on top of AWS ones)
+  "internet":              { stroke: "#232F3E", fill: "none",    dash: false, icon: "res:internet", bold: true },
+  "client-lane":           { stroke: "#232F3E", fill: "none",    dash: "2,2", icon: null },
+  "context":               { stroke: "#FF6464", fill: "none",    dash: true,  icon: null, bold: true },
+  "foundation":            { stroke: "#7D8998", fill: "#F7F7F7", dash: false, icon: null },
 };
 
 const INK = "#232F3E";
@@ -132,6 +138,51 @@ function validate(spec) {
   return errs;
 }
 
+
+// ---------- normalize: Ingeno lane rules ----------
+// 1. A client lane that holds a single item adds nothing: drop the box and keep the item.
+// 2. When every member of a client lane has the same edge (same other end, label, style), draw one
+//    edge from or to the lane instead of one per member. Partial matches stay per member.
+const LANE_TYPES = new Set(["client-lane"]);
+function normalize(spec) {
+  const s = JSON.parse(JSON.stringify(spec));
+  s.groups = s.groups || []; s.nodes = s.nodes || []; s.edges = s.edges || [];
+  const notes = [];
+  const kids = (gid) => [...s.groups.filter((g) => g.parent === gid), ...s.nodes.filter((n) => n.parent === gid)];
+  for (const g of [...s.groups]) {
+    if (!LANE_TYPES.has(g.type)) continue;
+    const k = kids(g.id);
+    if (k.length !== 1 || s.edges.some((e) => e.from === g.id || e.to === g.id)) continue;
+    k[0].parent = g.parent; if (!k[0].parent) delete k[0].parent;
+    s.groups = s.groups.filter((x) => x.id !== g.id);
+    notes.push(`lane ${g.id} held only ${k[0].id}: box removed`);
+  }
+  for (const g of s.groups.filter((g) => LANE_TYPES.has(g.type))) {
+    const members = kids(g.id).map((x) => x.id);
+    if (members.length < 2) continue;
+    for (const dir of ["from", "to"]) {
+      const other = dir === "from" ? "to" : "from";
+      const key = (e) => JSON.stringify([e[other], e.label || "", e.style || "solid", !!e.bidirectional]);
+      const byKey = new Map();
+      for (const e of s.edges) if (members.includes(e[dir]) && !members.includes(e[other])) {
+        if (!byKey.has(key(e))) byKey.set(key(e), []);
+        byKey.get(key(e)).push(e);
+      }
+      for (const list of byKey.values()) {
+        const covered = new Set(list.map((e) => e[dir]));
+        if (!members.every((m) => covered.has(m))) continue;
+        const merged = { ...list[0], [dir]: g.id };
+        if (list.some((e) => e.layout)) merged.layout = true;
+        const at = s.edges.indexOf(list[0]);
+        s.edges = s.edges.filter((e) => !list.includes(e));
+        s.edges.splice(Math.min(at, s.edges.length), 0, merged);
+        notes.push(`${list.map((e) => `${e.from}->${e.to}`).join(", ")} merged into ${merged.from}->${merged.to}`);
+      }
+    }
+  }
+  return { spec: s, notes };
+}
+
 // ---------- layout ----------
 async function layout(spec, cat) {
   const groups = spec.groups || [];
@@ -155,6 +206,9 @@ async function layout(spec, cat) {
       id: g.id,
       layoutOptions: {
         "elk.padding": "[top=56,left=28,bottom=28,right=28]",
+        // Room between columns and rows inside every box, so arrow captions fit between them.
+        "elk.spacing.nodeNode": "60",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "130",
         ...(g.direction ? { "elk.direction": g.direction } : {}),
       },
       children: children(g.id),
@@ -168,15 +222,21 @@ async function layout(spec, cat) {
       "elk.direction": spec.direction || "RIGHT",
       "elk.hierarchyHandling": "INCLUDE_CHILDREN",
       "elk.edgeRouting": "ORTHOGONAL",
-      "elk.spacing.nodeNode": "48",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "96",
+      "elk.spacing.nodeNode": "60",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "130",
       "elk.spacing.edgeNode": "24",
-      "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+      "elk.layered.nodePlacement.bk.fixedAlignment": "BALANCED",
+      "elk.layered.nodePlacement.favorStraightEdges": "true",
+      "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
       "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
       "elk.padding": "[top=0,left=0,bottom=0,right=0]",
     },
     children: children(null),
-    edges: (spec.edges || []).map((e, i) => ({ id: `e${i}`, sources: [e.from], targets: [e.to] })),
+    // Dashed edges mean "X uses Y" (dependency). They do not drive the layout: a shared dependency
+    // (WAF, Secrets Manager) would otherwise be pushed to the far end of the flow.
+    edges: (spec.edges || []).map((e, i) => ({ id: `e${i}`, sources: [e.from], targets: [e.to], dashed: e.style === "dashed" && !e.layout }))
+      .filter((e) => !e.dashed).map(({ dashed, ...e }) => e),
   };
   const out = await new ELK().layout(graph);
   const pos = new Map();
@@ -207,6 +267,147 @@ async function layout(spec, cat) {
     sides.set(i, [sideOf(abs(secs[0].startPoint), spec_e.from), sideOf(abs(secs[secs.length - 1].endPoint), spec_e.to)]);
   }
   return { pos, resolved, sides, width: out.width, height: out.height, warnings };
+}
+
+
+// ---------- refine: Ingeno readability rules applied after ELK ----------
+// 1. Column order: nodes stacked in the same column (same parent, same x) are reordered to
+//    minimize crossings, counting dashed "uses" edges too (ELK ignores them).
+// 2. Straight arrows: a node with one link is slid so its arrow runs straight, when there is room.
+// 3. Sides: aligned ends get straight arrows; other dependencies get a single-bend L
+//    (leave vertically, arrive horizontally) instead of a Z.
+function refine(spec, L) {
+  const groups = spec.groups || [], nodes = spec.nodes || [], edges = spec.edges || [];
+  const isGroup = (id) => groups.some((g) => g.id === id);
+  const parentOf = (id) => (groups.find((g) => g.id === id) || nodes.find((n) => n.id === id) || {}).parent || null;
+  const box = (id) => L.pos.get(id);
+  // anchor box: the icon for icon nodes, the whole box otherwise
+  const abox = (id) => {
+    const b = box(id);
+    if (!isGroup(id) && L.resolved.get(id)) return { x: b.x + (b.w - ICON) / 2, y: b.y, w: ICON, h: ICON };
+    return b;
+  };
+  const ctr = (id) => { const b = abox(id); return { x: b.x + b.w / 2, y: b.y + b.h / 2 }; };
+  const moveBy = (id, dx, dy) => {
+    const b = box(id); b.x += dx; b.y += dy;
+    if (isGroup(id)) for (const x of [...groups, ...nodes]) if (x.parent === id) moveBy(x.id, dx, dy);
+  };
+  const segX = (p1, p2, p3, p4) => {
+    const d = (a, b, c) => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    return d(p1, p2, p3) * d(p1, p2, p4) < 0 && d(p3, p4, p1) * d(p3, p4, p2) < 0;
+  };
+  const crossings = () => {
+    let n = 0;
+    for (let i = 0; i < edges.length; i++) for (let j = i + 1; j < edges.length; j++) {
+      const a = edges[i], b = edges[j];
+      if ([a.from, a.to].some((x) => x === b.from || x === b.to)) continue;
+      if (segX(ctr(a.from), ctr(a.to), ctr(b.from), ctr(b.to))) n++;
+    }
+    return n;
+  };
+  const notes = [];
+  // 1. column reorder
+  const cols = new Map();
+  for (const n of nodes) {
+    const b = box(n.id);
+    const k = `${n.parent || ""}|${Math.round(b.x)}`;
+    if (!cols.has(k)) cols.set(k, []);
+    cols.get(k).push(n.id);
+  }
+  const perms = (a) => (a.length <= 1 ? [a] : a.flatMap((x, i) => perms([...a.slice(0, i), ...a.slice(i + 1)]).map((r) => [x, ...r])));
+  for (const ids of cols.values()) {
+    if (ids.length < 2 || ids.length > 6) continue;
+    const start = [...ids].sort((a, b) => box(a).y - box(b).y);
+    const top0 = box(start[0]).y;
+    const gaps = start.slice(1).map((id, i) => box(id).y - (box(start[i]).y + box(start[i]).h));
+    const place = (order) => { let y = top0; order.forEach((id, i) => { box(id).y = y; y += box(id).h + (gaps[i] ?? 0); }); };
+    let best = start, bestN = crossings();
+    for (const o of perms(start)) { place(o); const c = crossings(); if (c < bestN) { best = o; bestN = c; } }
+    place(best);
+    if (best.join() !== start.join()) notes.push(`column reordered: ${best.join(", ")}`);
+  }
+  // 2. straighten single-link nodes
+  const degree = (id) => edges.filter((e) => e.from === id || e.to === id).length;
+  const siblings = (id) => [...groups, ...nodes].filter((x) => x.id !== id && (x.parent || null) === parentOf(id)).map((x) => x.id);
+  const fits = (id, dy) => {
+    const b = box(id), nb = { x: b.x, y: b.y + dy, w: b.w, h: b.h };
+    const par = parentOf(id);
+    if (par) { const p = box(par), g = groups.find((x) => x.id === par); const top = (g.label ?? g.type) === "" ? 16 : 56; if (nb.y < p.y + top || nb.y + nb.h > p.y + p.h - 16) return false; }
+    return siblings(id).every((s) => { const o = box(s); return nb.x + nb.w + 16 <= o.x || o.x + o.w + 16 <= nb.x || nb.y + nb.h + 16 <= o.y || o.y + o.h + 16 <= nb.y; });
+  };
+  const locked = new Set();
+  // 2a. near misses (up to 40 px) are snapped straight, whatever the node's degree
+  for (const e of edges) {
+    for (const [mover, other] of [[e.to, e.from], [e.from, e.to]]) {
+      if (isGroup(mover) || locked.has(mover)) continue;
+      const a = ctr(mover), b = ctr(other);
+      const dy = b.y - a.y;
+      if (Math.abs(dy) < 0.5 || Math.abs(dy) > 40 || Math.abs(b.x - a.x) < Math.abs(b.y - a.y) || !fits(mover, dy)) continue;
+      moveBy(mover, 0, dy); locked.add(mover); locked.add(other);
+      notes.push(`${mover} snapped to ${other}`);
+      break;
+    }
+  }
+  // 2b. single-link nodes slide to their only partner
+  for (const e of edges) {
+    for (const [mover, other] of [[e.from, e.to], [e.to, e.from]]) {
+      if (isGroup(mover) || degree(mover) !== 1 || locked.has(mover)) continue;
+      const a = ctr(mover), b = ctr(other);
+      if (Math.abs(b.x - a.x) < Math.abs(b.y - a.y)) continue; // mostly vertical: leave it
+      const dy = b.y - a.y;
+      if (Math.abs(dy) < 0.5 || !fits(mover, dy)) continue;
+      moveBy(mover, 0, dy); locked.add(mover);
+      notes.push(`${mover} aligned with ${other}`);
+      break;
+    }
+  }
+  // 3. sides. Flow arrows (solid) are settled first; dependencies (dashed) then pick, among
+  //    four simple routes, the one that avoids a side already used by a flow arrow, then runs
+  //    through the fewest icons, then has the fewest bends (vertical-first L on a tie).
+  const sides = new Map();
+  const used = new Set(); // "node|side" taken by solid edges
+  const straight = (e) => {
+    const a = abox(e.from), b = abox(e.to), ca = ctr(e.from), cb = ctr(e.to);
+    const dx = cb.x - ca.x, dy = cb.y - ca.y;
+    const hOverlap = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+    const vOverlap = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+    if (Math.abs(dy) <= 8 || (hOverlap > 24 && Math.abs(dx) > Math.abs(dy))) return dx >= 0 ? ["right", "left"] : ["left", "right"];
+    if (Math.abs(dx) <= 8 || (vOverlap > 24 && Math.abs(dy) > Math.abs(dx))) return dy >= 0 ? ["bottom", "top"] : ["top", "bottom"];
+    return null;
+  };
+  edges.forEach((e, i) => {
+    if (e.style === "dashed") return;
+    const sd = straight(e) || L.sides.get(i) || sideFor({ cx: ctr(e.from).x, cy: ctr(e.from).y }, { cx: ctr(e.to).x, cy: ctr(e.to).y });
+    sides.set(i, sd);
+    used.add(`${e.from}|${sd[0]}`); used.add(`${e.to}|${sd[1]}`);
+  });
+  const hits = (e, pts) => nodes.filter((n) => n.id !== e.from && n.id !== e.to).filter((n) => {
+    const b = box(n.id);
+    return pts.slice(1).some((q, k) => {
+      const p0 = pts[k];
+      const x1 = Math.min(p0.x, q.x), x2 = Math.max(p0.x, q.x), y1 = Math.min(p0.y, q.y), y2 = Math.max(p0.y, q.y);
+      return x2 >= b.x && x1 <= b.x + b.w && y2 >= b.y && y1 <= b.y + b.h;
+    });
+  }).length;
+  edges.forEach((e, i) => {
+    if (e.style !== "dashed") return;
+    const st = straight(e);
+    if (st) { sides.set(i, st); return; }
+    const ca = ctr(e.from), cb = ctr(e.to), dx = cb.x - ca.x, dy = cb.y - ca.y;
+    const V = dy >= 0 ? ["bottom", "top"] : ["top", "bottom"], H = dx >= 0 ? ["right", "left"] : ["left", "right"];
+    const my = (ca.y + cb.y) / 2, mx = (ca.x + cb.x) / 2;
+    const cands = [
+      { sd: [V[0], H[1]], bends: 1, pts: [ca, { x: ca.x, y: cb.y }, cb] },
+      { sd: [H[0], V[1]], bends: 1, pts: [ca, { x: cb.x, y: ca.y }, cb] },
+      { sd: [V[0], V[1]], bends: 2, pts: [ca, { x: ca.x, y: my }, { x: cb.x, y: my }, cb] },
+      { sd: [H[0], H[1]], bends: 2, pts: [ca, { x: mx, y: ca.y }, { x: mx, y: cb.y }, cb] },
+    ].map((c, k) => ({ ...c, k, conflicts: used.has(`${e.from}|${c.sd[0]}`) + used.has(`${e.to}|${c.sd[1]}`), hits: hits(e, c.pts) }));
+    cands.sort((a, b) => a.conflicts - b.conflicts || a.hits - b.hits || a.bends - b.bends || a.k - b.k);
+    sides.set(i, cands[0].sd);
+  });
+  L.sides = sides;
+  notes.push(`estimated crossings: ${crossings()}`);
+  return notes;
 }
 
 // One array item per line: readable in a Miro code widget without being huge.
@@ -240,15 +441,20 @@ function depth(groups, id) {
 }
 
 async function render(opts) {
-  const spec = loadJSON(opts.spec);
+  const raw = loadJSON(opts.spec);
   const cat = new Catalog(opts.catalog);
-  const errs = validate(spec);
+  const errs = validate(raw);
   if (errs.length) { console.error(JSON.stringify({ ok: false, errors: errs }, null, 1)); process.exit(2); }
+  const { spec, notes } = normalize(raw);
   const base = String(opts.base || "").replace(/\/?$/, "/");
   const logoBase = String(opts["logo-base"] || base).replace(/\/?$/, "/");
   const url = (e) => (e.kind === "logo" ? logoBase : base) + e.file;
 
   const L = await layout(spec, cat);
+  const refineNotes = refine(spec, L);
+  const titles = new Map([...L.pos].map(([k, v]) => [k, v.title]));
+  const quality = optimize(spec, L, titles, { iters: Number(opts.iters || 6000), seed: Number(opts.seed || 7) });
+  if (opts.preview) fs.writeFileSync(opts.preview, previewSvg(spec, L, titles));
   const groups = spec.groups || [];
   const nodes = spec.nodes || [];
   const edges = spec.edges || [];
@@ -264,7 +470,6 @@ async function render(opts) {
   const frameTitle = `v${v} · ${spec.title || "Architecture"}${spec.change ? " · " + spec.change : ""}`;
 
   const out = [];
-  const pairs = []; // [icon id, label id] to group in Miro after creation
   const P = (id) => { const p = L.pos.get(id); return { x: Math.round(ox + p.x), y: Math.round(oy + p.y), w: Math.round(p.w), h: Math.round(p.h), title: p.title }; };
 
   out.push(`<svg>`);
@@ -276,19 +481,20 @@ async function render(opts) {
   for (const g of gs) {
     const st = GROUPS[g.type];
     const p = P(g.id);
-    out.push(`<rect id="g_${g.id}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" fill="${st.fill}" stroke="${st.stroke}" stroke-width="2"${st.dash ? ' stroke-dasharray="5,5"' : ""}/>`);
+    out.push(`<rect id="g_${g.id}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" fill="${st.fill}" stroke="${st.stroke}" stroke-width="2"${st.dash ? ` stroke-dasharray="${st.dash === true ? "5,5" : st.dash}"` : ""}/>`);
   }
   for (const g of gs) {
     const st = GROUPS[g.type];
     const p = P(g.id);
     const icon = st.icon && cat.byId.get(st.icon);
     const label = g.label ?? g.type;
+    const fw = st.bold ? ' font-weight="bold"' : "";
+    if (label === "") continue;
     if (icon) {
       out.push(`<image id="gi_${g.id}" data-type="image" href="${esc(url(icon))}" x="${p.x}" y="${p.y}" width="32" height="32"/>`);
-      pairs.push([`gi_${g.id}`, `gt_${g.id}`]);
-      out.push(`<text id="gt_${g.id}" x="${p.x + 40}" y="${p.y + 21}" font-family="${FONT}" font-size="14" fill="${INK}">${esc(label)}</text>`);
+      out.push(`<text id="gt_${g.id}" x="${p.x + 40}" y="${p.y + 21}" font-family="${FONT}" font-size="14"${fw} fill="${INK}">${esc(label)}</text>`);
     } else {
-      out.push(`<text id="gt_${g.id}" x="${p.x + 12}" y="${p.y + 21}" font-family="${FONT}" font-size="14" fill="${st.stroke === "#7D8998" ? INK : st.stroke}">${esc(label)}</text>`);
+      out.push(`<text id="gt_${g.id}" x="${p.x + 12}" y="${p.y + 21}" font-family="${FONT}" font-size="14"${fw} fill="${["#7D8998", "#232F3E"].includes(st.stroke) ? INK : st.stroke}">${esc(label)}</text>`);
     }
   }
 
@@ -304,10 +510,13 @@ async function render(opts) {
   edges.forEach((e, i) => {
     const [s1, s2] = L.sides.get(i) && L.sides.get(i)[0] && L.sides.get(i)[1] ? L.sides.get(i) : sideFor(center(e.from), center(e.to));
     const a = center(e.from), b = center(e.to);
-    const label = e.label ? ` data-content="${esc(e.label)}"` : "";
+    const t = L.capPos && L.capPos.get(i);
+    const label = e.label ? ` data-content="${esc(e.label)}"${t != null && t !== 0.5 ? ` data-caption-position="${Math.round(t * 100)}%"` : ""}` : "";
     const dash = e.style === "dashed" ? ' stroke-dasharray="5,5"' : "";
     const arrow = e.bidirectional ? "both" : "end";
-    out.push(`<line id="e_${i}" x1="${Math.round(a.cx)}" y1="${Math.round(a.cy)}" x2="${Math.round(b.cx)}" y2="${Math.round(b.cy)}" stroke="${INK}" stroke-width="2" data-arrow="${arrow}" data-shape="elbowed" data-start="${anchor(e.from)}" data-end="${anchor(e.to)}" data-start-side="${s1}" data-end-side="${s2}"${dash}${label}/>`);
+    // An arrow that leaves or arrives under an icon attaches to its label, so it never hides the text.
+    const end = (id, side) => (side === "bottom" && !groups.some((g) => g.id === id) && L.resolved.get(id) ? `nt_${id}` : anchor(id));
+    out.push(`<line id="e_${i}" x1="${Math.round(a.cx)}" y1="${Math.round(a.cy)}" x2="${Math.round(b.cx)}" y2="${Math.round(b.cy)}" stroke="${INK}" stroke-width="2" data-arrow="${arrow}" data-shape="elbowed" data-start="${end(e.from, s1)}" data-end="${end(e.to, s2)}" data-start-side="${s1}" data-end-side="${s2}"${dash}${label}/>`);
   });
 
   // 3. nodes
@@ -318,7 +527,6 @@ async function render(opts) {
     const role = n.label ? esc(n.label).replace(/\n/g, "<br/>") : "";
     if (hit) {
       out.push(`<image id="n_${n.id}" data-type="image" href="${esc(url(hit))}" x="${p.x + (p.w - ICON) / 2}" y="${p.y}" width="${ICON}" height="${ICON}"/>`);
-      pairs.push([`n_${n.id}`, `nt_${n.id}`]);
       out.push(`<textArea id="nt_${n.id}" x="${p.x}" y="${p.y + ICON + 6}" width="${p.w}" font-family="${FONT}" font-size="14" text-align="center" fill="${INK}">${title}${role ? "<br/>" + role : ""}</textArea>`);
     } else {
       out.push(`<rect id="n_${n.id}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="8" fill="#ffffff" stroke="#7D8998" stroke-width="2" data-content="&lt;b&gt;${title}&lt;/b&gt;${role ? "&lt;br&gt;" + role : ""}" data-text-color="${INK}" data-font-size="14" data-font-family="${FONT}"/>`);
@@ -356,7 +564,11 @@ async function render(opts) {
 
   const svg = out.join("\n");
   if (opts.out) fs.writeFileSync(opts.out, svg);
-  const summary = { ok: true, frame: { title: frameTitle, x: fx, y: fy, width: frameW, height: frameH }, warnings: L.warnings, icons: Object.fromEntries(nodes.map((n) => [n.id, L.resolved.get(n.id)?.id || "generic"])), group_pairs: pairs };
+  const summary = { ok: true, frame: { title: frameTitle, x: fx, y: fy, width: frameW, height: frameH }, warnings: L.warnings, normalized: notes, quality,
+    // Pairs to group after creation (Miro REST POST /v2/boards/{id}/groups): icon + label move together.
+    group_pairs: [...nodes.filter((n) => L.resolved.get(n.id)).map((n) => [`n_${n.id}`, `nt_${n.id}`]),
+      ...groups.filter((g) => GROUPS[g.type].icon && (g.label ?? g.type) !== "").map((g) => [`gi_${g.id}`, `gt_${g.id}`])],
+    icons: Object.fromEntries(nodes.map((n) => [n.id, L.resolved.get(n.id)?.id || "generic"])) };
   if (opts.out) console.log(JSON.stringify(summary, null, 1));
   else console.log(svg);
 }
@@ -398,8 +610,11 @@ async function readback(opts) {
     if (!card) throw new Error("no spec card in the board read and no --spec given");
     spec = JSON.parse(decode(card.attrs["data-description"]));
   }
+  spec = normalize(spec).spec; // idempotent: the card already holds the normalized spec
   const cat = new Catalog(opts.catalog);
   const L = await layout(spec, cat);
+  refine(spec, L);
+  optimize(spec, L, new Map([...L.pos].map(([k, v]) => [k, v.title])), { iters: Number(opts.iters || 6000), seed: Number(opts.seed || 7) });
   const ox = MARGIN, oy = MARGIN + 20;
 
   // frame-relative board widgets (children of the frame <g>) + connectors (anywhere)

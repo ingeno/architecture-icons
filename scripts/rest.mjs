@@ -11,8 +11,9 @@
 //   node rest.mjs ids    --plan plan.json --frame <frame id> --items items1.json [items2.json ...] [--out ids.json]
 //        Matches the frame children listed by GET /v2/boards/{b}/items?parent_item_id=<frame>
 //        to the plan by type and position. Writes { "<svg id>": "<miro id>" }.
-//   node rest.mjs fill   --plan plan.json --ids ids.json --step connectors|groups
-//        Prints the request bodies of that step with every placeholder replaced by a Miro id.
+//   node rest.mjs fill   --plan plan.json --ids ids.json --step frame|items|card|connectors|groups [--dir bodies]
+//        Prints the request bodies of that step with every placeholder replaced by a Miro id
+//        (--dir: writes them to files instead, to send with stage_upload + body_ref).
 //   node rest.mjs tosvg  --items items1.json [...] --connectors conn1.json [...] --frame <frame id> [--card card.json] [--out board.svg]
 //        Rebuilds an SVG in the canvas_read_as_svg dialect for `adm.mjs readback`.
 
@@ -227,6 +228,8 @@ function fill(opts) {
   const walk = (o) => (Array.isArray(o) ? o.map(walk) : o && typeof o === "object" ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, walk(v)])) : sub(o));
   const steps = p.calls.filter((c) => c.step === opts.step || c.step.startsWith(opts.step + ":"));
   const out = steps.map((c) => ({ method: c.method, url: c.url.replace("@frame", ids.frame), body: JSON.stringify(walk(c.body)) }));
+  // --dir writes one body file per call, for stage_upload + body_ref (no need to paste big bodies).
+  if (opts.dir) { fs.mkdirSync(opts.dir, { recursive: true }); out.forEach((c, k) => { c.file = `${opts.dir}/${opts.step}_${k + 1}.json`; fs.writeFileSync(c.file, c.body); delete c.body; }); }
   console.log(JSON.stringify(out, null, 1));
 }
 
